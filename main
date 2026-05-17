@@ -3,14 +3,23 @@
 #include <ESP32Servo.h>
 #include <Keypad.h>
 
-// ── LCD ──────────────────────────────────────────────
+// ── Blynk ─────────────────────────────────────────────
+#define BLYNK_TEMPLATE_ID   "TMPLxxxxxx"
+#define BLYNK_TEMPLATE_NAME "Smart Door"
+#define BLYNK_AUTH_TOKEN    "xxxxxxxxxxxx"
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+char ssid[] = "το_WiFi_σου";
+char pass[] = "ο_κωδικός_σου";
+
+// ── LCD ───────────────────────────────────────────────
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ── Servo ─────────────────────────────────────────────
 Servo doorServo;
-#define SERVO_PIN     32
-#define DOOR_OPEN     90
-#define DOOR_CLOSED    0
+#define SERVO_PIN    32
+#define DOOR_OPEN    90
+#define DOOR_CLOSED   0
 
 // ── Keypad ────────────────────────────────────────────
 const byte ROWS = 4, COLS = 4;
@@ -25,14 +34,14 @@ byte colPins[COLS] = {33,  4, 15, 27};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 // ── Ultrasonic ────────────────────────────────────────
-#define TRIG_PIN 13
-#define ECHO_PIN 14
-#define PRESENCE_CM 20   // κατώφλι παρουσίας σε cm
+#define TRIG_PIN    13
+#define ECHO_PIN    14
+#define PRESENCE_CM 20
 
 // ── Buzzer ────────────────────────────────────────────
 #define BUZZER_PIN 16
 
-// ── RGB LED (common anode → LOW = ΟΝ) ─────────────────
+// ── RGB LED (common anode → LOW = ON) ─────────────────
 #define LED_R 2
 #define LED_G 25
 #define LED_B 26
@@ -41,22 +50,23 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 #define RELAY_PIN 5
 
 // ── Gas sensor MQ-2 ───────────────────────────────────
-#define GAS_AOUT  34
-#define GAS_DOUT  35
-#define GAS_THRESHOLD 2000   // 0–4095, ρύθμισε κατά βούληση
+#define GAS_AOUT          34
+#define GAS_DOUT          35
+#define GAS_THRESHOLD   3800
+#define SMOKE_CONFIRM_COUNT 5
 
-// ── Κωδικός πρόσβασης ─────────────────────────────────
+// ── Κωδικός ───────────────────────────────────────────
 const String CORRECT_PIN = "1234";
 String inputBuffer = "";
 
-// ── Κατάσταση συστήματος ──────────────────────────────
-bool doorOpen      = false;
-bool smokeAlert    = false;
-bool alarmActive   = false;
+// ── State ─────────────────────────────────────────────
+bool doorOpen    = false;
+bool smokeAlert  = false;
+bool alarmActive = false;
+int  smokeCounter = 0;
 
 // ─────────────────────────────────────────────────────
 void setRGB(bool r, bool g, bool b) {
-  // common anode: LOW = ΟΝ
   digitalWrite(LED_R, !r);
   digitalWrite(LED_G, !g);
   digitalWrite(LED_B, !b);
@@ -79,7 +89,7 @@ void openDoor() {
 }
 
 void closeDoor() {
-  if (smokeAlert) return;   // δεν κλείνει αν υπάρχει καπνός!
+  if (smokeAlert) return;
   doorServo.write(DOOR_CLOSED);
   doorOpen = false;
   digitalWrite(RELAY_PIN, LOW);
@@ -87,62 +97,57 @@ void closeDoor() {
 
 void triggerAlarm() {
   tone(BUZZER_PIN, 1000, 500);
-  setRGB(true, false, false);   // κόκκινο
+  setRGB(true, false, false);
 }
 
 void smokeAlertMode() {
   smokeAlert  = true;
   alarmActive = true;
-  openDoor();                   // κράτα την πόρτα ανοιχτή
+  openDoor();
   lcd.clear();
   lcd.setCursor(0, 0); lcd.print("!! SMOKE ALERT !!");
   lcd.setCursor(0, 1); lcd.print("Door forced OPEN");
   triggerAlarm();
+  Blynk.virtualWrite(V1, 1);
+  Blynk.logEvent("smoke_alert", "Smoke detected! Door forced open.");
 }
 
 void clearSmokeAlert() {
-  smokeAlert  = false;
-  alarmActive = false;
+  smokeAlert   = false;
+  alarmActive  = false;
+  smokeCounter = 0;
   noTone(BUZZER_PIN);
   lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("System Ready");
-  setRGB(false, true, false);   // πράσινο
+  lcd.setCursor(0, 0); lcd.print("Enter PIN:");
+  setRGB(false, true, false);
+  Blynk.virtualWrite(V1, 0);
 }
 
 // ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
-  // LCD
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0); lcd.print("Smart Door v1.0");
   lcd.setCursor(0, 1); lcd.print("Initializing...");
 
-  // Servo
   doorServo.attach(SERVO_PIN);
   closeDoor();
 
-  // Ultrasonic
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-
-  // Buzzer
   pinMode(BUZZER_PIN, OUTPUT);
-
-  // RGB LED
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
-  setRGB(false, true, false);   // πράσινο = έτοιμο
-
-  // Relay
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
-
-  // MQ-2
   pinMode(GAS_DOUT, INPUT);
-  // GAS_AOUT → analogRead, δεν χρειάζεται pinMode
+
+  digitalWrite(RELAY_PIN, LOW);
+  setRGB(false, true, false);
 
   delay(1500);
   lcd.clear();
@@ -151,23 +156,31 @@ void setup() {
 
 // ─────────────────────────────────────────────────────
 void loop() {
+  Blynk.run();
 
-  // ── 1. Έλεγχος MQ-2 ──────────────────────────────
-  int  gasLevel     = analogRead(GAS_AOUT);
-  bool digitalSmoke = digitalRead(GAS_DOUT) == HIGH;
+  // ── 1. MQ-2 έλεγχος με debounce ──────────────────
+  int  gasLevel = analogRead(GAS_AOUT);
+  bool digitalSmoke = false;   // αγνοούμε το DOUT
 
-  if ((gasLevel > GAS_THRESHOLD || digitalSmoke) && !smokeAlert) {
-    Serial.printf("SMOKE: analog=%d digital=%d\n", gasLevel, digitalSmoke);
+  Blynk.virtualWrite(V0, gasLevel);
+  Serial.printf("Gas: %d | Counter: %d\n", gasLevel, smokeCounter);
+
+  if (gasLevel > GAS_THRESHOLD) {
+    smokeCounter++;
+  } else {
+    smokeCounter = 0;
+  }
+
+  if (smokeCounter >= SMOKE_CONFIRM_COUNT && !smokeAlert) {
     smokeAlertMode();
   }
 
-  // Αν έφυγε ο καπνός, επαναφορά (προαιρετικό)
-  if (smokeAlert && gasLevel < GAS_THRESHOLD && !digitalSmoke) {
+  if (smokeAlert && gasLevel < GAS_THRESHOLD) {
     clearSmokeAlert();
   }
 
+  // Κατά τη διάρκεια smoke alert: μόνο blink και έξοδος
   if (smokeAlert) {
-    // Εναλλάσσε buzzer/LED κάθε 500 ms
     static unsigned long lastBeep = 0;
     if (millis() - lastBeep > 500) {
       lastBeep = millis();
@@ -175,32 +188,31 @@ void loop() {
       if (alarmActive) triggerAlarm();
       else { noTone(BUZZER_PIN); setRGB(true, false, false); }
     }
-    return;   // παρακάμπτουμε τα υπόλοιπα όσο καίγεται ο συναγερμός
+    return;
   }
 
-  // ── 2. Ultrasonic – παρουσία ──────────────────────
-  long dist = readDistanceCM();
+  // ── 2. Ultrasonic ─────────────────────────────────
+  long dist    = readDistanceCM();
   bool presence = (dist > 0 && dist < PRESENCE_CM);
 
   if (presence && !doorOpen) {
     lcd.clear();
     lcd.setCursor(0, 0); lcd.print("Person detected!");
     lcd.setCursor(0, 1); lcd.print("Enter PIN:");
-    setRGB(false, false, true);  // μπλε = αναμένει κωδικό
+    setRGB(false, false, true);
   }
 
   // ── 3. Keypad ─────────────────────────────────────
   char key = keypad.getKey();
   if (key) {
     if (key == '#') {
-      // Επιβεβαίωση κωδικού
       if (inputBuffer == CORRECT_PIN) {
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("Access Granted");
-        setRGB(false, true, false);   // πράσινο
+        setRGB(false, true, false);
         tone(BUZZER_PIN, 2000, 200);
         openDoor();
-        delay(5000);                  // πόρτα ανοιχτή 5 δευτερόλεπτα
+        delay(5000);
         closeDoor();
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("Enter PIN:");
@@ -208,7 +220,7 @@ void loop() {
       } else {
         lcd.clear();
         lcd.setCursor(0, 0); lcd.print("Wrong PIN!");
-        setRGB(true, false, false);   // κόκκινο
+        setRGB(true, false, false);
         tone(BUZZER_PIN, 300, 1000);
         delay(2000);
         lcd.clear();
@@ -219,17 +231,14 @@ void loop() {
       lcd.setCursor(0, 1); lcd.print("                ");
 
     } else if (key == '*') {
-      // Διαγραφή
       inputBuffer = "";
       lcd.setCursor(0, 1); lcd.print("                ");
 
     } else {
-      // Προσθήκη χαρακτήρα (μέγιστο 4)
       if (inputBuffer.length() < 4) {
         inputBuffer += key;
         lcd.setCursor(0, 1);
-        // Εμφάνισε αστερίσκους για ασφάλεια
-        for (int i = 0; i < inputBuffer.length(); i++) lcd.print('*');
+        for (unsigned int i = 0; i < inputBuffer.length(); i++) lcd.print('*');
       }
     }
   }
