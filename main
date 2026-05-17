@@ -50,19 +50,19 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 #define RELAY_PIN 5
 
 // ── Gas sensor MQ-2 ───────────────────────────────────
-#define GAS_AOUT          34
-#define GAS_DOUT          35
-#define GAS_THRESHOLD   3800
+#define GAS_AOUT           34
+#define GAS_DOUT           35
 #define SMOKE_CONFIRM_COUNT 5
+int GAS_THRESHOLD = 3800;   // θα οριστεί δυναμικά στο setup
 
 // ── Κωδικός ───────────────────────────────────────────
 const String CORRECT_PIN = "1234";
 String inputBuffer = "";
 
 // ── State ─────────────────────────────────────────────
-bool doorOpen    = false;
-bool smokeAlert  = false;
-bool alarmActive = false;
+bool doorOpen     = false;
+bool smokeAlert   = false;
+bool alarmActive  = false;
 int  smokeCounter = 0;
 
 // ─────────────────────────────────────────────────────
@@ -131,25 +131,38 @@ void setup() {
 
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0, 0); lcd.print("Smart Door v1.0");
-  lcd.setCursor(0, 1); lcd.print("Initializing...");
 
   doorServo.attach(SERVO_PIN);
-  closeDoor();
 
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+  pinMode(TRIG_PIN,   OUTPUT);
+  pinMode(ECHO_PIN,   INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_R, OUTPUT);
-  pinMode(LED_G, OUTPUT);
-  pinMode(LED_B, OUTPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(GAS_DOUT, INPUT);
+  pinMode(LED_R,      OUTPUT);
+  pinMode(LED_G,      OUTPUT);
+  pinMode(LED_B,      OUTPUT);
+  pinMode(RELAY_PIN,  OUTPUT);
+  pinMode(GAS_DOUT,   INPUT);
 
   digitalWrite(RELAY_PIN, LOW);
+  doorServo.write(DOOR_CLOSED);
   setRGB(false, true, false);
 
-  delay(1500);
+  // ── Auto-calibration MQ-2 ───────────────────────────
+  lcd.setCursor(0, 0); lcd.print("Calibrating...  ");
+  lcd.setCursor(0, 1); lcd.print("Please wait...  ");
+  long sum = 0;
+  for (int i = 0; i < 20; i++) {
+    sum += analogRead(GAS_AOUT);
+    delay(100);
+  }
+  int baseline = sum / 20;
+  GAS_THRESHOLD = baseline + 300;
+  Serial.printf("Baseline: %d | Threshold: %d\n", baseline, GAS_THRESHOLD);
+  lcd.setCursor(0, 0); lcd.print("Threshold set:  ");
+  lcd.setCursor(0, 1); lcd.print(GAS_THRESHOLD);
+  lcd.print("            ");
+  delay(2000);
+
   lcd.clear();
   lcd.setCursor(0, 0); lcd.print("Enter PIN:");
 }
@@ -158,12 +171,11 @@ void setup() {
 void loop() {
   Blynk.run();
 
-  // ── 1. MQ-2 έλεγχος με debounce ──────────────────
-  int  gasLevel = analogRead(GAS_AOUT);
-  bool digitalSmoke = false;   // αγνοούμε το DOUT
-
+  // ── 1. MQ-2 με debounce ───────────────────────────
+  int gasLevel = analogRead(GAS_AOUT);
   Blynk.virtualWrite(V0, gasLevel);
-  Serial.printf("Gas: %d | Counter: %d\n", gasLevel, smokeCounter);
+  Serial.printf("Gas: %d | Threshold: %d | Counter: %d\n",
+                 gasLevel, GAS_THRESHOLD, smokeCounter);
 
   if (gasLevel > GAS_THRESHOLD) {
     smokeCounter++;
@@ -179,7 +191,7 @@ void loop() {
     clearSmokeAlert();
   }
 
-  // Κατά τη διάρκεια smoke alert: μόνο blink και έξοδος
+  // ── Smoke alert loop ──────────────────────────────
   if (smokeAlert) {
     static unsigned long lastBeep = 0;
     if (millis() - lastBeep > 500) {
@@ -192,7 +204,7 @@ void loop() {
   }
 
   // ── 2. Ultrasonic ─────────────────────────────────
-  long dist    = readDistanceCM();
+  long dist     = readDistanceCM();
   bool presence = (dist > 0 && dist < PRESENCE_CM);
 
   if (presence && !doorOpen) {
