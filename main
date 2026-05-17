@@ -1,280 +1,378 @@
-#include <SPI.h>
-#include <MFRC522.h>
+#include <Wire.h>
 #include <Keypad.h>
 #include <ESP32Servo.h>
 #include <LiquidCrystal_I2C.h>
 
 // ════════════════════════════════════════════════════════
+//   BLYNK CONFIG  ← συμπλήρωσε τα δικά σου στοιχεία
+// ════════════════════════════════════════════════════════
+#define BLYNK_TEMPLATE_ID   "TMPL4XmSQac7Q"
+#define BLYNK_TEMPLATE_NAME "gate"
+#define BLYNK_AUTH_TOKEN    "-yBI1zKh00tYdjzArlafDmm_LObfQOot"
+
+#define BLYNK_PRINT Serial
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+// Virtual Pins
+#define VP_GATE_CONTROL  V0   // Blynk → ESP32 : άνοιγμα/κλείσιμο
+#define VP_GATE_STATUS   V1   // ESP32 → Blynk : κατάσταση πύλης
+#define VP_DISTANCE      V2   // ESP32 → Blynk : απόσταση cm
+#define VP_LAST_EVENT    V3   // ESP32 → Blynk : log τελευταίας ενέργειας
+#define VP_OBSTACLE      V4   // ESP32 → Blynk : 1=εμπόδιο, 0=ελεύθερο
+
+// ════════════════════════════════════════════════════════
 //   ΕΞΥΠΝΗ ΠΥΛΗ ΕΙΣΟΔΟΥ ΚΤΙΡΙΟΥ
-//   Μέθοδοι πρόσβασης: RFID κάρτα + PIN μέσω Keypad
-//   Hardware: ESP32, MFRC522, Keypad 4x4, Servo,
-//             HC-SR04 Ultrasonic, LCD 16x2 I2C
+//   Hardware: ESP32, Keypad 4x4, Servo, HC-SR04,
+//             LCD I2C, Buzzer, RGB LED (common anode), Relay
 // ════════════════════════════════════════════════════════
 
-// ─── RFID RC522 ──────────────────────────────────────────
-// Το RFID module χρησιμοποιεί SPI επικοινωνία με τον ESP32
-// SS_PIN  : Slave Select - ενεργοποιεί το module
-// RST_PIN : Reset - αρχικοποιεί το module όταν χρειαστεί
-#define SS_PIN    5
-#define RST_PIN   27
-MFRC522 rfid(SS_PIN, RST_PIN);  // Δημιουργία αντικειμένου RFID
-
-// ─── SERVO MOTOR ─────────────────────────────────────────
-// Ο servo κινεί φυσικά την πύλη
-// 0°  = κλειστή πύλη
-// 90° = ανοιχτή πύλη
-#define SERVO_PIN 15
+// ─── SERVO ───────────────────────────────────────────────
+#define SERVO_PIN 32
 Servo gateServo;
 
 // ─── ULTRASONIC HC-SR04 ───────────────────────────────────
-// Ο αισθητήρας μετρά απόσταση για να αποφύγει
-// να κλείσει η πύλη πάνω σε άνθρωπο ή εμπόδιο
-// TRIG: στέλνει υπερηχητικό παλμό
-// ECHO: λαμβάνει την ανάκλαση και μετράει χρόνο
-#define TRIG_PIN  4
-#define ECHO_PIN  2
+#define TRIG_PIN 13
+#define ECHO_PIN 14
 
-// ─── LCD 16x2 με I2C ─────────────────────────────────────
-// Η οθόνη εμφανίζει μηνύματα κατάστασης στον χρήστη
-// Διεύθυνση I2C: 0x27 (συνηθισμένη για LCD με I2C adapter)
-// Αν δεν δουλεύει δοκίμασε 0x3F
+// ─── BUZZER ───────────────────────────────────────────────
+#define BUZZER_PIN 16
+
+// ─── RGB LED (Common Anode → COM στο 3.3V) ───────────────
+#define LED_R  2
+#define LED_G 25
+#define LED_B 26
+
+// ─── RELAY ───────────────────────────────────────────────
+#define RELAY_PIN 5
+
+// ─── LCD I2C ─────────────────────────────────────────────
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ─── KEYPAD 4×4 ──────────────────────────────────────────
-// Ο χρήστης πληκτρολογεί PIN για να ανοίξει την πύλη
-// Διάταξη πλήκτρων όπως εμφανίζεται στο keypad
-const byte ROWS = 4;  // 4 γραμμές
-const byte COLS = 4;  // 4 στήλες
+const byte ROWS = 4;
+const byte COLS = 4;
+
 char keys[ROWS][COLS] = {
   {'1','2','3','A'},
   {'4','5','6','B'},
   {'7','8','9','C'},
   {'*','0','#','D'}
 };
-// rowPins: GPIO pins που συνδέονται στις γραμμές του keypad (R1-R4)
-// colPins: GPIO pins που συνδέονται στις στήλες του keypad (C1-C4)
-byte rowPins[ROWS] = {13, 12, 14, 26};
-byte colPins[COLS] = {25, 33, 32, 35};
+
+byte rowPins[ROWS] = {23, 19, 18, 17};
+byte colPins[COLS] = {33,  4, 15, 27};
+
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-// ─── ΣΤΑΘΕΡΕΣ ΣΥΣΤΗΜΑΤΟΣ ─────────────────────────────────
-// CORRECT_PIN    : το μυστικό PIN που δίνει πρόσβαση
-// AUTHORIZED_UID : το UID της εξουσιοδοτημένης RFID κάρτας
-//                  (βρες το από το Serial Monitor όταν σκανάρεις την κάρτα)
-const String CORRECT_PIN    = "1234";
-const String AUTHORIZED_UID = "A1B2C3D4";
+// ─── ACCESS DATA ─────────────────────────────────────────
+const String CORRECT_PIN = "1234";
 
-// ─── ΜΕΤΑΒΛΗΤΕΣ ΚΑΤΆΣΤΑΣΗΣ ───────────────────────────────
-String enteredPin = "";         // Αποθηκεύει τα ψηφία που πληκτρολογεί ο χρήστης
-bool gateOpen = false;          // true = πύλη ανοιχτή, false = κλειστή
-unsigned long gateOpenTime = 0; // Χρονική στιγμή που άνοιξε η πύλη (ms)
+// ─── STATE ───────────────────────────────────────────────
+String enteredPin = "";
+bool gateOpen = false;
+unsigned long gateOpenTime = 0;
+const unsigned long GATE_OPEN_DURATION = 8000;
 
-// Χρόνος που μένει ανοιχτή η πύλη πριν κλείσει αυτόματα (5 δευτερόλεπτα)
-const unsigned long GATE_OPEN_DURATION = 5000;
+// Blynk timer για ανανέωση δεδομένων
+BlynkTimer timer;
+
+// ─── PROTOTYPES ──────────────────────────────────────────
+void checkKeypad();
+void grantAccess(String method);
+void denyAccess(String reason);
+void openGate();
+void closeGate();
+void showIdle();
+long getDistance();
+void buzzerOK();
+void buzzerFail();
+void setRGB(bool r, bool g, bool b);
+void sendSensorData();
+void logEvent(String event);
 
 // ════════════════════════════════════════════════════════
-//   SETUP - Εκτελείται μία φορά κατά την εκκίνηση
+//   BLYNK: Λήψη εντολής από dashboard (V0)
+//   0 = κλείσιμο, 1 = άνοιγμα
 // ════════════════════════════════════════════════════════
-void setup() {
-  Serial.begin(115200); // Ενεργοποίηση Serial για debugging
-
-  // Αρχικοποίηση SPI και RFID module
-  SPI.begin();
-  rfid.PCD_Init();
-  Serial.println("RFID Reader έτοιμο.");
-
-  // Σύνδεση servo και αρχική θέση (κλειστή πύλη)
-  gateServo.attach(SERVO_PIN);
-  gateServo.write(0);
-  Serial.println("Servo αρχικοποιήθηκε - Πύλη ΚΛΕΙΣΤΗ.");
-
-  // Ορισμός pins ultrasonic
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  Serial.println("Ultrasonic sensor έτοιμο.");
-
-  // Αρχικοποίηση LCD και εμφάνιση μηνύματος εκκίνησης
-  lcd.init();
-  lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("  Smart Gate  ");
-  lcd.setCursor(0, 1);
-  lcd.print(" Initializing ");
-  delay(2000);
-
-  showIdle(); // Εμφάνιση αρχικής οθόνης αναμονής
+BLYNK_WRITE(VP_GATE_CONTROL) {
+  int val = param.asInt();
+  if (val == 1 && !gateOpen) {
+    grantAccess("Blynk App");
+  } else if (val == 0 && gateOpen) {
+    closeGate();
+    logEvent("Remote CLOSE");
+  }
 }
 
 // ════════════════════════════════════════════════════════
-//   LOOP - Επαναλαμβάνεται συνεχώς
+//   SETUP
+// ════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\nSYSTEM STARTING...");
+
+  // Servo
+  gateServo.attach(SERVO_PIN, 500, 2400);
+  gateServo.write(0);
+  Serial.println("Servo READY - Gate CLOSED");
+
+  // Ultrasonic
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // RGB
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  setRGB(false, false, false);
+
+  // Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  // LCD
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(" SMART GATE ");
+  lcd.setCursor(0, 1);
+  lcd.print(" Connecting...");
+
+  // WiFi + Blynk
+  Serial.println("Connecting to WiFi + Blynk...");
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  Serial.println("Blynk CONNECTED");
+
+  // Self-test
+  setRGB(false, false, true);
+  buzzerOK();
+  delay(400);
+  setRGB(false, false, false);
+
+  // Timer: στέλνε sensor data κάθε 2 δευτερόλεπτα
+  timer.setInterval(2000L, sendSensorData);
+
+  showIdle();
+  logEvent("System START");
+  Serial.println("SYSTEM READY");
+}
+
+// ════════════════════════════════════════════════════════
+//   LOOP
 // ════════════════════════════════════════════════════════
 void loop() {
+  Blynk.run();   // ← απαραίτητο για Blynk
+  timer.run();   // ← απαραίτητο για BlynkTimer
 
-  // ── Βήμα 1: Έλεγχος αυτόματου κλεισίματος πύλης ──────
-  // Αν έχει περάσει ο χρόνος GATE_OPEN_DURATION από το άνοιγμα
+  // Auto-close logic
   if (gateOpen && (millis() - gateOpenTime >= GATE_OPEN_DURATION)) {
+    long distance = getDistance();
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.println(" cm");
 
-    if (getDistance() > 20) {
-      // Δεν υπάρχει εμπόδιο κοντά → κλείσε την πύλη κανονικά
+    if (distance > 20 || distance >= 999) {
       closeGate();
     } else {
-      // Εντοπίστηκε εμπόδιο → περίμενε, μην κλείσεις
       lcd.clear();
       lcd.setCursor(0, 0);
-      lcd.print("  Εμπόδιο!  ");
+      lcd.print("OBSTACLE FOUND!");
       lcd.setCursor(0, 1);
-      lcd.print("  Αναμονή...  ");
-      gateOpenTime = millis(); // Επαναφορά του χρονομέτρου
-      Serial.println("⚠️ Εμπόδιο εντοπίστηκε - αναβολή κλεισίματος.");
+      lcd.print("Waiting...");
+      Serial.println("Obstacle! Waiting...");
+      Blynk.virtualWrite(VP_OBSTACLE, 1);
+      logEvent("Obstacle detected");
+      gateOpenTime = millis();
     }
   }
 
-  // ── Βήμα 2: Έλεγχος για νέα RFID κάρτα ───────────────
-  checkRFID();
-
-  // ── Βήμα 3: Έλεγχος για πλήκτρα στο Keypad ───────────
   checkKeypad();
 }
 
 // ════════════════════════════════════════════════════════
-//   ΣΥΝΑΡΤΗΣΕΙΣ
+//   BLYNK: Στέλνει δεδομένα στο dashboard κάθε 2s
 // ════════════════════════════════════════════════════════
-
-// ── Ανάγνωση και έλεγχος RFID κάρτας ────────────────────
-// Διαβάζει το UID της κάρτας και το συγκρίνει με το εξουσιοδοτημένο
-void checkRFID() {
-  // Αν δεν υπάρχει νέα κάρτα κοντά, επέστρεψε
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
-
-  // Μετατροπή UID σε αναγνώσιμη μορφή hex string (π.χ. "A1B2C3D4")
-  String uid = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    if (rfid.uid.uidByte[i] < 0x10) uid += "0"; // Προσθήκη μηδενικού αν χρειάζεται
-    uid += String(rfid.uid.uidByte[i], HEX);
-  }
-  uid.toUpperCase(); // Κεφαλαία για ομοιομορφία
-
-  Serial.println("📡 RFID UID που διαβάστηκε: " + uid);
-
-  // Σύγκριση με εξουσιοδοτημένο UID
-  if (uid == AUTHORIZED_UID) {
-    grantAccess("RFID OK");
-  } else {
-    denyAccess("Αγνωστη καρτα");
-  }
-
-  // Σταμάτημα επικοινωνίας με κάρτα για αποφυγή επανάληψης
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
+void sendSensorData() {
+  long dist = getDistance();
+  Blynk.virtualWrite(VP_DISTANCE, dist >= 999 ? 0 : dist);
+  Blynk.virtualWrite(VP_GATE_STATUS, gateOpen ? 1 : 0);
+  Blynk.virtualWrite(VP_OBSTACLE, 0);  // reset obstacle flag
 }
 
-// ── Ανάγνωση Keypad και έλεγχος PIN ──────────────────────
-// # = επιβεβαίωση PIN
-// * = διαγραφή / επαναφορά
-// 0-9 = προσθήκη ψηφίου
+// ════════════════════════════════════════════════════════
+//   BLYNK: Log γεγονότος
+// ════════════════════════════════════════════════════════
+void logEvent(String event) {
+  Serial.println("EVENT: " + event);
+  Blynk.virtualWrite(VP_LAST_EVENT, event);
+}
+
+// ════════════════════════════════════════════════════════
+//   KEYPAD CHECK
+// ════════════════════════════════════════════════════════
 void checkKeypad() {
   char key = keypad.getKey();
-  if (!key) return; // Κανένα πλήκτρο δεν πατήθηκε
+  if (!key) return;
+
+  Serial.print("Key pressed: ");
+  Serial.println(key);
 
   if (key == '#') {
-    // Ο χρήστης επιβεβαιώνει το PIN
-    Serial.println("🔑 PIN που εισήχθη: " + enteredPin);
+    Serial.print("PIN entered: ");
+    Serial.println(enteredPin);
+
     if (enteredPin == CORRECT_PIN) {
       grantAccess("PIN OK");
     } else {
-      denyAccess("Lathos PIN");
+      denyAccess("WRONG PIN");
     }
-    enteredPin = ""; // Καθαρισμός PIN μετά τον έλεγχο
+    enteredPin = "";
 
   } else if (key == '*') {
-    // Ο χρήστης ακυρώνει και ξεκινά από την αρχή
     enteredPin = "";
-    Serial.println("🔄 PIN διαγράφηκε.");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("PIN CLEARED");
+    delay(800);
     showIdle();
 
   } else {
-    // Προσθήκη ψηφίου στο PIN
-    enteredPin += key;
-
-    // Εμφάνιση αστερίσκων στην οθόνη για λόγους ασφάλειας
-    lcd.clear();
+    if (enteredPin.length() < 8) {
+      enteredPin += key;
+    }
     lcd.setCursor(0, 0);
-    lcd.print("Eisagogi PIN:");
+    lcd.print("ENTER PIN:      ");
     lcd.setCursor(0, 1);
-    String stars = "";
-    for (int i = 0; i < (int)enteredPin.length(); i++) stars += "*";
-    lcd.print(stars);
+    for (size_t i = 0; i < enteredPin.length(); i++) lcd.print('*');
+    for (size_t i = enteredPin.length(); i < 16; i++) lcd.print(' ');
   }
 }
 
-// ── Επιτυχής πρόσβαση ────────────────────────────────────
-// Καλείται όταν το PIN ή το RFID είναι σωστό
+// ════════════════════════════════════════════════════════
+//   ACCESS GRANTED
+// ════════════════════════════════════════════════════════
 void grantAccess(String method) {
-  Serial.println("✅ Προσβαση επιτραπηκε - " + method);
+  Serial.println("ACCESS GRANTED - " + method);
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(" KALOS IRTHES  ");
+  lcd.print(" ACCESS OK!");
   lcd.setCursor(0, 1);
-  lcd.print("  " + method + "  ");
+  lcd.print(method);
+
+  logEvent("GRANTED: " + method);
+
+  setRGB(false, true, false);
+  digitalWrite(RELAY_PIN, HIGH);
   openGate();
+  buzzerOK();
 }
 
-// ── Απόρριψη πρόσβασης ───────────────────────────────────
-// Καλείται όταν το PIN ή το RFID είναι λάθος
+// ════════════════════════════════════════════════════════
+//   ACCESS DENIED
+// ════════════════════════════════════════════════════════
 void denyAccess(String reason) {
-  Serial.println("❌ Προσβαση απορριφθηκε - " + reason);
+  Serial.println("ACCESS DENIED - " + reason);
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(" ACCESS DENIED ");
+  lcd.print("ACCESS DENIED");
   lcd.setCursor(0, 1);
-  lcd.print(" " + reason + " ");
-  delay(2000);  // Εμφάνιση μηνύματος για 2 δευτερόλεπτα
+  lcd.print(reason);
+
+  logEvent("DENIED: " + reason);
+
+  setRGB(true, false, false);
+  buzzerFail();
+  delay(1500);
+  setRGB(false, false, false);
   showIdle();
 }
 
-// ── Άνοιγμα πύλης ────────────────────────────────────────
-// Κινεί τον servo στα 90° και ξεκινά το χρονόμετρο αυτόματου κλεισίματος
+// ════════════════════════════════════════════════════════
+//   GATE OPEN / CLOSE
+// ════════════════════════════════════════════════════════
 void openGate() {
-  gateServo.write(90);        // 90° = ανοιχτή θέση
+  Serial.println("GATE OPENING...");
+  gateServo.write(90);
   gateOpen = true;
-  gateOpenTime = millis();    // Καταγραφή χρόνου ανοίγματος
-  Serial.println("🚪 Πυλη ΑΝΟΙΧΤΗ - Αυτοματο κλεισιμο σε 5 δευτερολεπτα.");
+  gateOpenTime = millis();
+  Blynk.virtualWrite(VP_GATE_STATUS, 1);
+  Blynk.virtualWrite(VP_GATE_CONTROL, 1);  // συγχρονισμός button στο app
+  Serial.println("GATE OPEN - auto close in 8s");
 }
 
-// ── Κλείσιμο πύλης ───────────────────────────────────────
-// Επιστρέφει τον servo στα 0° (κλειστή θέση)
 void closeGate() {
-  gateServo.write(0);   // 0° = κλειστή θέση
+  Serial.println("GATE CLOSING...");
+  gateServo.write(0);
   gateOpen = false;
-  Serial.println("🚪 Πυλη ΚΛΕΙΣΤΗ.");
+  digitalWrite(RELAY_PIN, LOW);
+  setRGB(false, false, false);
+  Blynk.virtualWrite(VP_GATE_STATUS, 0);
+  Blynk.virtualWrite(VP_GATE_CONTROL, 0);  // συγχρονισμός button στο app
+  Blynk.virtualWrite(VP_OBSTACLE, 0);
+  logEvent("Gate CLOSED");
+  Serial.println("GATE CLOSED");
   showIdle();
 }
 
-// ── Μέτρηση απόστασης με Ultrasonic ──────────────────────
-// Στέλνει παλμό και μετρά πόσο χρόνο παίρνει να επιστρέψει
-// Επιστρέφει απόσταση σε εκατοστά (cm)
+// ════════════════════════════════════════════════════════
+//   ULTRASONIC DISTANCE (cm). Returns 999 on timeout.
+// ════════════════════════════════════════════════════════
 long getDistance() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);   // Έναρξη παλμού 10μs
+  digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);    // Τέλος παλμού
-
-  // pulseIn: μετρά χρόνο (μs) που το ECHO παραμένει HIGH
-  // timeout 30000μs = 30ms ≈ μέγιστη απόσταση ~5 μέτρα
+  digitalWrite(TRIG_PIN, LOW);
   long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-
-  // Τύπος: απόσταση = (χρόνος × ταχύτητα_ήχου) / 2
-  // Ταχύτητα ήχου ≈ 0.034 cm/μs, διαιρούμε με 2 (πήγαινε + γύρισε)
-  return duration * 0.034 / 2;
+  if (duration == 0) return 999;
+  return (long)(duration * 0.0343 / 2.0);
 }
 
-// ── Οθόνη αναμονής ───────────────────────────────────────
-// Εμφανίζεται όταν το σύστημα είναι έτοιμο για είσοδο
+// ════════════════════════════════════════════════════════
+//   RGB LED
+// ════════════════════════════════════════════════════════
+void setRGB(bool r, bool g, bool b) {
+  digitalWrite(LED_R, r ? LOW : HIGH);
+  digitalWrite(LED_G, g ? LOW : HIGH);
+  digitalWrite(LED_B, b ? LOW : HIGH);
+}
+
+// ════════════════════════════════════════════════════════
+//   BUZZER SOUNDS
+// ════════════════════════════════════════════════════════
+void buzzerOK() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(80);
+  }
+}
+
+void buzzerFail() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(500);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ════════════════════════════════════════════════════════
+//   IDLE SCREEN
+// ════════════════════════════════════════════════════════
 void showIdle() {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Scan RFID or");
+  lcd.print("Enter PIN + #");
   lcd.setCursor(0, 1);
-  lcd.print("PIN + # ");
+  lcd.print("(* to clear)");
 }
